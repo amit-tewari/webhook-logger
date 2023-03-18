@@ -2,7 +2,9 @@ package main
 
 import (
 	"database/sql"
-	// b64 "encoding/base64"
+	"io/ioutil"
+
+	b64 "encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,17 +13,27 @@ import (
 	"os"
 	_ "os"
 
-	"github.com/go-playground/webhooks/v6/gitlab"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
-	path                = "/webhooks"
+	path                = "/"
 	defaultDBFile       = "/tmp/webbook.db"
 	defaultLogFile      = "/tmp/webhook-log.txt"
 	defaultGitlabSecret = "MyGitLabToken"
 	//defaultGithubSecret = "MyGitHubToken"
 )
+
+type gitlabEvent struct {
+	contentLength string
+	eventType     string
+	instance      string
+	payload       string
+	token         string
+	userAgent     string
+	eventUuid     string
+	gotAllHeaders bool
+}
 
 func getEnv(key, fallback string) string {
 	value, exists := os.LookupEnv(key)
@@ -37,34 +49,83 @@ func openOrCreateDB(dbFileName string) *sql.DB {
 		log.Fatal(err)
 	}
 
-	eventTableSQL := `CREATE TABLE IF NOT EXISTS k8Event(
-			"id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
+	webhookTableDDL := `CREATE TABLE IF NOT EXISTS gitlab_webhooks(
+			"id" integer NOT NULL PRIMARY KEY ASC on conflict fail AUTOINCREMENT,
 			created_at integer(4) not null default (strftime('%s','now')),
-			processed_at integer(4),
-			"event" TEXT
+			processed_at 	integer(4),	-- when this row was last processed
+			gotAllHeaders 	boolean, 	-- did we get all headers?
+			contentLength 	INTEGER(4), -- content length
+			userAgent 		TEXT, 		-- User-Agent
+			eventType 		TEXT, 		-- GitLab Event
+			instance 		TEXT,  		-- Gitlab Instance
+			eventUuid 		TEXT, 		-- Gitlab event UUID
+			token 			TEXT, 		-- Token
+			"payload" 		TEXT 		-- event payload
 		);`
 
-	podResourceTableSQL := `CREATE TABLE IF NOT EXISTS k8PodResource(
+	pipelineTableDDL := `CREATE TABLE IF NOT EXISTS gitlab_pipeline(
 			"id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
-			created_at integer(4) not null default (strftime('%s','now')),
-			processed_at integer(4),
-			"pod_resource" TEXT
+			created_at 		integer(4) not null default (strftime('%s','now')),
+			processed_at 	integer(4),
+			event_uuid 		TEXT, 		-- Gitlab event UUID
+			instance 		TEXT,  		-- Gitlab Instance
+			"pod_resource" 	TEXT
 		);`
 
-	statement, err := dbConn.Prepare(eventTableSQL) // Prepare SQL Statement
+	jobTableDDL := `
+		CREATE TABLE IF NOT EXISTS gitlab_job(
+			"id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
+			created_at integer(4) not null default (strftime('%s','now')),
+			processed_at 	integer(4),
+			event_uuid 		TEXT, 		-- Gitlab event UUID
+			instance 		TEXT,  		-- Gitlab Instance
+			"pod_resource" 	TEXT
+		);`
+	pipelineViewDDL := `
+		CREATE VIEW IF NOT EXISTS pipelines AS 
+			SELECT 
+  				json_extract(payload, '$.object_kind') AS kind,
+    			json_extract(payload, '$.object_attributes.id') as pipeline_id,
+	  			json_extract(payload, '$.object_attributes.status') as status,
+	    		payload
+			FROM
+		  		gitlab_webhooks gw
+		  	WHERE 
+		    	json_extract(payload, '$.object_kind') == 'pipeline';`
+
+	statement, err := dbConn.Prepare(webhookTableDDL) // Prepare SQL Statement
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 	statement.Exec() // Execute SQL Statements
 
-	statement1, err := dbConn.Prepare(podResourceTableSQL) // Prepare SQL Statement
+	statement, err = dbConn.Prepare(pipelineTableDDL) // Prepare SQL Statement
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	statement1.Exec() // Execute SQL Statements
+	statement.Exec()                             // Execute SQL Statements
+	statement, err = dbConn.Prepare(jobTableDDL) // Prepare SQL Statement
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	statement.Exec()                                 // Execute SQL Statements
+	statement, err = dbConn.Prepare(pipelineViewDDL) // Prepare SQL Statement
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	statement.Exec() // Execute SQL Statements
 	return dbConn
 }
-
+func containsValuesInArray(values []string, array []string) bool {
+	for _, v := range values {
+		for _, a := range array {
+			if a == v {
+				return true
+			}
+		}
+	}
+	return false
+}
 func main() {
 
 	// Set variables from environment
@@ -83,18 +144,24 @@ func main() {
 	defer dbHandle.Close()
 
 	// Test insert
-	insertSQL := "INSERT INTO k8Event(event) VALUES (?)"
-	statement, err := dbHandle.Prepare(insertSQL)
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
-	_, err = statement.Exec("Hello")
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
+	insertSQLGitlabEvent := `
+		INSERT INTO gitlab_webhooks
+			(
+			contentLength,
+			userAgent,
+			eventType,
+			instance,
+			eventUuid,
+			payload,
+			token,
+			gotAllHeaders
+			)
+		VALUES (?,?,?,?,?,?,?,?)`
 
-	//db, err := sql.Open("sqlite3", dbFileName)
-	//checkErr(err)
+	stmntInsertSQLGitlabEvent, err := dbHandle.Prepare(insertSQLGitlabEvent)
+	if err != nil {
+		log.Fatalln(err.Error())
+	}
 
 	// Open Log file
 	logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
@@ -105,11 +172,9 @@ func main() {
 	log.SetOutput(mw)
 	log.Print("Started the GitLab webhook listner.\n")
 
-	// Setup GitLab Token in Library
-	hook, _ := gitlab.New(gitlab.Options.Secret(gitlabSecret))
-
 	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		//var bodyBytes []byte
+		var bodyBytes []byte
+		var vgitlabEvent gitlabEvent
 
 		//log.Print("Inside handler\n")
 
@@ -123,246 +188,292 @@ func main() {
 		//fmt.Printf("Headers: %+v\n", r.Header)
 		headers := make([]string, len(r.Header))
 
-		i := 0
-		for header := range r.Header {
-			headers[i] = header
-			i++
-			fmt.Printf("%s: %s\n", header, r.Header[header][0])
+		//  i := 0
+		//  for header := range r.Header {
+		//  	headers[i] = header
+		//  	i++
+		//  	//fmt.Printf("%s: %s\n", header, r.Header[header][0])
+		//  }
+		gitlabHeaders := []string{
+			"X-Gitlab-Instance",
+			"X-Gitlab-Event",
+			"X-Gitlab-Token",
+			"X-Gitlab-Event-Uuid",
 		}
-		// fmt.Printf("Headers: %s\n", r.Header["Content-Type"][0])
-		// fmt.Printf("Headers: %s\n", r.Header["User-Agent"][0])
-		// fmt.Printf("Headers: %s\n", r.Header["X-Gitlab-Event"][0])
-		// fmt.Printf("Headers: %s\n", r.Header["X-Gitlab-Instance"][0])
-		// fmt.Printf("Headers: %s\n", r.Header["X-Gitlab-Token"][0])
-		// fmt.Printf("Headers: %s\n", r.Header["X-Gitlab-Event-Uuid"][0])
-
-		// if r.Body != nil {
-		// 	bodyBytes, err = ioutil.ReadAll(r.Body)
-		// 	if err != nil {
-		// 		fmt.Printf("Body reading error: %v", err)
-		// 		return
-		// 	}
-		// 	defer r.Body.Close()
-		// }
-		// if len(bodyBytes) > 0 {
-		// 	//var prettyJSON bytes.Buffer
-		// 	//if err = json.Indent(&prettyJSON, bodyBytes, "", "\t"); err != nil {
-		// 	//	fmt.Printf("JSON parse error: %v", err)
-		// 	//	return
-		// 	//}
-		// 	//fmt.Println(string(prettyJSON.Bytes()))
-		// 	if bodyJSON, err := json.Marshal(bodyBytes); err != nil {
-		// 		fmt.Printf("JSON parse error: %v", err)
-		// 		return
-		// 	} else {
-		// 		//fmt.Printf("%+s", bodyJSON)
-		// 		str1 := string(bodyJSON[1 : len(bodyJSON)-1]) // body is double qouted
-		// 		//fmt.Println(str1)
-		// 		x, _ := b64.StdEncoding.DecodeString(str1)
-		// 		fmt.Printf("%s", string(x))
-		// 	}
-		// } else {
-		// 	fmt.Printf("Body: No Body Supplied\n")
-		// }
-
-		//https://pkg.go.dev/github.com/go-playground/webhooks/v6@v6.0.0-beta.3/gitlab#Event
-		payload, err := hook.Parse(r,
-			gitlab.PushEvents,
-			gitlab.TagEvents,
-			gitlab.IssuesEvents,
-			gitlab.ConfidentialIssuesEvents,
-			gitlab.CommentEvents,
-			gitlab.MergeRequestEvents,
-			gitlab.WikiPageEvents,
-			gitlab.PipelineEvents,
-			gitlab.BuildEvents,
-			gitlab.JobEvents,
-			gitlab.SystemHookEvents)
-		if err != nil {
-			if err == gitlab.ErrEventNotFound {
-				// ok event wasn;t one of the ones asked to be parsed
+		if containsValuesInArray(gitlabHeaders, headers) {
+			//fmt.Println("Array contains one of the specified values")
+			vgitlabEvent = gitlabEvent{
+				contentLength: r.Header["Content-Length"][0],
+				eventType:     r.Header["X-Gitlab-Event"][0],
+				instance:      r.Header["X-Gitlab-Instance"][0],
+				token:         r.Header["X-Gitlab-Token"][0],
+				userAgent:     r.Header["User-Agent"][0],
+				eventUuid:     r.Header["X-Gitlab-Event-Uuid"][0],
 			}
+			// fmt.Printf("%s\n", vgitlabEvent.contentLength)
+		} else {
+			fmt.Println("Array does not contain any of the specified values")
 		}
 
-		//log.Printf("%+v", payload)
-		switch payload.(type) {
-
-		// ConfidentialIssueEvent
-		case gitlab.ConfidentialIssueEventPayload:
-			confidentialIssue := payload.(gitlab.ConfidentialIssueEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", confidentialIssue)
-			confidentialIssueJsonData, err := json.Marshal(confidentialIssue)
+		if r.Body != nil {
+			bodyBytes, err = ioutil.ReadAll(r.Body)
 			if err != nil {
-				log.Fatal(err)
+				fmt.Printf("Body reading error: %v", err)
+				return
 			}
-			log.Printf("%s\n", confidentialIssueJsonData)
-
-		// PushEvent
-		case gitlab.PushEventPayload:
-			push := payload.(gitlab.PushEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", push)
-			pushJsonData, err := json.Marshal(push)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("%s\n", pushJsonData)
-
-		// TagEvent
-		case gitlab.TagEventPayload:
-			tag := payload.(gitlab.TagEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", tag)
-			tagJsonData, err := json.Marshal(tag)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("%s\n", tagJsonData)
-
-		// IssueEvent
-		case gitlab.IssueEventPayload:
-			issue := payload.(gitlab.IssueEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", issues)
-			issueJsonData, err := json.Marshal(issue)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("%s\n", issueJsonData)
-
-		// CommentEvent
-		case gitlab.CommentEventPayload:
-			comment := payload.(gitlab.CommentEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", comment)
-			commentJsonData, err := json.Marshal(comment)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("%s\n", commentJsonData)
-
-		// MergeRequestEvent
-		case gitlab.MergeRequestEventPayload:
-			mergeRequest := payload.(gitlab.MergeRequestEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", mergeRequest)
-			mergeRequestJsonData, err := json.Marshal(mergeRequest)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("%s\n", mergeRequestJsonData)
-
-		// WikiPageEvent
-		case gitlab.WikiPageEventPayload:
-			wikiPage := payload.(gitlab.WikiPageEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", wikiPage)
-			wikiPageJsonData, err := json.Marshal(wikiPage)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("%s\n", wikiPageJsonData)
-
-		// PipelineEvent
-		case gitlab.PipelineEventPayload:
-			pipeline := payload.(gitlab.PipelineEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", pipeline)
-			//pipelineJsonData, err := json.Marshal(pipeline)
-			//if err != nil {
-			//	log.Fatal(err)
+			defer r.Body.Close()
+		}
+		if len(bodyBytes) > 0 {
+			//var prettyJSON bytes.Buffer
+			//if err = json.Indent(&prettyJSON, bodyBytes, "", "\t"); err != nil {
+			//	fmt.Printf("JSON parse error: %v", err)
+			//	return
 			//}
-			//log.Printf("%s\n", pipelineJsonData)
-			pipeline_id := pipeline.ObjectAttributes.ID
-			pipeline_status := pipeline.ObjectAttributes.Status
-			pipeline_duration := pipeline.ObjectAttributes.Duration
-			pipeline_project_name := pipeline.Project.PathWithNamespace
-			//for i, build := range pipeline.Builds {
-			for _, build := range pipeline.Builds {
-				//log.Printf("\npipeline id: %d, build id: %d, runer id: %d, status %s Stage %s Name %s build index%d  %+v",
-				log.Printf("\n{\"pipeline_id\": \"%d\", \"Status\": \"%s\", \"Project\":\"%s\", \"duration\": \"%d\", \"build\": {\"id\": \"%d\", \"status\": \"%s\"}, \"runner\": {\"id\": \"%d\",  \"desc\": \"%s\"}}",
-					pipeline_id,
-					pipeline_status,
-					pipeline_project_name,
-					pipeline_duration,
-					build.ID,
-					build.Status,
-					build.Runner.ID,
-					build.Runner.Description)
-				//	build.Stage,
-				//	build.Name,
-				//	i, build)
+			//fmt.Println(string(prettyJSON.Bytes()))
+			if bodyJSON, err := json.Marshal(bodyBytes); err != nil {
+				fmt.Printf("JSON parse error: %v", err)
+				return
+			} else {
+				//fmt.Printf("%+s", bodyJSON)
+				str1 := string(bodyJSON[1 : len(bodyJSON)-1]) // body is double qouted
+				//fmt.Println(str1)
+				x, _ := b64.StdEncoding.DecodeString(str1)
+				//fmt.Printf("%s\n", string(x))
+				vgitlabEvent.payload = string(x)
 			}
-
-		// BuildEvent
-		case gitlab.BuildEventPayload:
-			build := payload.(gitlab.BuildEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", build)
-			//buildJsonData, err := json.Marshal(build)
-			//if err != nil {
-			//	log.Fatal(err)
-			//}
-			//log.Printf("%s\n", buildJsonData)
-			log.Printf("\n{\"build_id\": \"%d\", \"Status\": \"%s\", \"stage\": \"%s\", \"name\": \"%s\", \"started_at\": \"%s\", \"finished_at\": \"%s\", \"duration\": \"%0.2f\"}",
-				build.BuildID,
-				build.BuildStatus,
-				build.BuildStage,
-				build.BuildName,
-				build.BuildStartedAt.Time,
-				build.BuildFinishedAt.Time,
-				build.BuildDuration)
-			//build)
-
-		// JobEvent
-		case gitlab.JobEventPayload:
-			job := payload.(gitlab.JobEventPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", job)
-			jobJsonData, err := json.Marshal(job)
+			_, err = stmntInsertSQLGitlabEvent.Exec(
+				vgitlabEvent.contentLength,
+				vgitlabEvent.userAgent,
+				vgitlabEvent.eventType,
+				vgitlabEvent.instance,
+				vgitlabEvent.eventUuid,
+				vgitlabEvent.payload,
+				vgitlabEvent.token,
+				vgitlabEvent.gotAllHeaders,
+			)
 			if err != nil {
-				log.Fatal(err)
+				log.Fatalln(err.Error())
 			}
-			log.Printf("%s\n", jobJsonData)
-
-		// SystemHookEvent
-		case gitlab.SystemHookPayload:
-			systemHook := payload.(gitlab.SystemHookPayload)
-			// Do whatever you want from here...
-			//log.Printf("%+v", systemHook)
-			systemHookJsonData, err := json.Marshal(systemHook)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("%s\n", systemHookJsonData)
-			//case gitlab.JobEventPayload:
-			//	//https://docs.gitlab.com/ee/user/project/integrations/webhooks.html#job-events
-			//	job := payload.(gitlab.JobEventPayload)
-			//	// Do whatever you want from here...
-			//	//log.Printf("%+v", job)
-			//	data, err := json.Marshal(job)
-			//	if err != nil {
-			//		log.Fatal(err)
-			//	}
-			//	log.Printf("%s\n", data)
-
-			//case gitlab.BuildEventPayload:
-			//	//
-			//	build := payload.(gitlab.BuildEventPayload)
-			//	// Do whatever you want from here...
-			//	//log.Printf("%+v", build)
-			//	data, err := json.Marshal(build)
-			//	if err != nil {
-			//		log.Fatal(err)
-			//	}
-			//	log.Printf("%s\n", data)
+		} else {
+			fmt.Printf("Body: No Body Supplied\n")
 		}
+		//fmt.Printf("%+v\n", vgitlabEvent)
 	})
-	http.ListenAndServe(":4000", nil)
+	http.ListenAndServe("0.0.0.0:4000", nil)
 }
 func checkErr(err error) {
 	if err != nil {
 		panic(err)
 	}
 }
+
+// BUILD
+// =====
+// object_kind
+// build_id
+// build_name
+// build_stage
+// build_status
+// build_created_at
+// build_started_at
+// build_finished_at
+// build_duration
+// build_queued_duration
+// build_failure_reason
+// pipeline_id
+// runner.id
+// runner.description
+// runner.runner_type
+// runner.is_shared
+// runner.tags []
+// project_id
+// project_name
+//
+//
+// PIPELINE
+// ========
+// object_kind
+// object_attributes.id
+// object_attributes.source
+// object_attributes.status
+// object_attributes.detailed_status
+// object_attributes.stages []
+// created_at
+// finished_at
+// duration
+// queued_duration
+// project.id
+// project.path_with_namespace
+
+// type build struct {
+// 	ObjectKind          string      `json:"object_kind"`
+// 	Ref                 string      `json:"ref"`
+// 	Tag                 bool        `json:"tag"`
+// 	BeforeSha           string      `json:"before_sha"`
+// 	Sha                 string      `json:"sha"`
+// 	BuildID             int64       `json:"build_id"`
+// 	BuildName           string      `json:"build_name"`
+// 	BuildStage          string      `json:"build_stage"`
+// 	BuildStatus         string      `json:"build_status"`
+// 	BuildCreatedAt      string      `json:"build_created_at"`
+// 	BuildStartedAt      string      `json:"build_started_at"`
+// 	BuildFinishedAt     string      `json:"build_finished_at"`
+// 	BuildDuration       float64     `json:"build_duration"`
+// 	BuildQueuedDuration float64     `json:"build_queued_duration"`
+// 	BuildAllowFailure   bool        `json:"build_allow_failure"`
+// 	BuildFailureReason  string      `json:"build_failure_reason"`
+// 	PipelineID          int         `json:"pipeline_id"`
+// 	Runner              Runner      `json:"runner"`
+// 	ProjectID           int         `json:"project_id"`
+// 	ProjectName         string      `json:"project_name"`
+// 	User                User        `json:"user"`
+// 	Commit              Commit      `json:"commit"`
+// 	Repository          Repository  `json:"repository"`
+// 	Environment         interface{} `json:"environment"`
+// }
+// type Runner struct {
+// 	ID          int      `json:"id"`
+// 	Description string   `json:"description"`
+// 	RunnerType  string   `json:"runner_type"`
+// 	Active      bool     `json:"active"`
+// 	IsShared    bool     `json:"is_shared"`
+// 	Tags        []string `json:"tags"`
+// }
+// type User struct {
+// 	ID        int    `json:"id"`
+// 	Name      string `json:"name"`
+// 	Username  string `json:"username"`
+// 	AvatarURL string `json:"avatar_url"`
+// 	Email     string `json:"email"`
+// }
+// type Commit struct {
+// 	ID          int         `json:"id"`
+// 	Name        interface{} `json:"name"`
+// 	Sha         string      `json:"sha"`
+// 	Message     string      `json:"message"`
+// 	AuthorName  string      `json:"author_name"`
+// 	AuthorEmail string      `json:"author_email"`
+// 	AuthorURL   string      `json:"author_url"`
+// 	Status      string      `json:"status"`
+// 	Duration    int         `json:"duration"`
+// 	StartedAt   string      `json:"started_at"`
+// 	FinishedAt  string      `json:"finished_at"`
+// }
+// type Repository struct {
+// 	Name            string      `json:"name"`
+// 	URL             string      `json:"url"`
+// 	Description     interface{} `json:"description"`
+// 	Homepage        string      `json:"homepage"`
+// 	GitHTTPURL      string      `json:"git_http_url"`
+// 	GitSSHURL       string      `json:"git_ssh_url"`
+// 	VisibilityLevel int         `json:"visibility_level"`
+// }
+
+//  build {Runner, User, Commit, Repository}
+//  pipeline {ObjectAttributes {variables}, User, Project, Commit{Author}, Builds{ArtifactsFile,User,Runner}, SourcePipeline{Project} }
+
+// type pipeline struct {
+// 	ObjectKind       string           `json:"object_kind"`
+// 	ObjectAttributes ObjectAttributes `json:"object_attributes"`
+// 	MergeRequest     interface{}      `json:"merge_request"`
+// 	User             User             `json:"user"`
+// 	Project          Project          `json:"project"`
+// 	Commit           Commit           `json:"commit"`
+// 	Builds           []Builds         `json:"builds"`
+// 	SourcePipeline   SourcePipeline   `json:"source_pipeline"`
+// }
+// type Variables struct {
+// 	Key   string `json:"key"`
+// 	Value string `json:"value"`
+// }
+// type ObjectAttributes struct {
+// 	ID             int         `json:"id"`
+// 	Iid            int         `json:"iid"`
+// 	Ref            string      `json:"ref"`
+// 	Tag            bool        `json:"tag"`
+// 	Sha            string      `json:"sha"`
+// 	BeforeSha      string      `json:"before_sha"`
+// 	Source         string      `json:"source"`
+// 	Status         string      `json:"status"`
+// 	DetailedStatus string      `json:"detailed_status"`
+// 	Stages         []string    `json:"stages"`
+// 	CreatedAt      string      `json:"created_at"`
+// 	FinishedAt     string      `json:"finished_at"`
+// 	Duration       int         `json:"duration"`
+// 	QueuedDuration int         `json:"queued_duration"`
+// 	Variables      []Variables `json:"variables"`
+// }
+// type User struct {
+// 	ID        int    `json:"id"`
+// 	Name      string `json:"name"`
+// 	Username  string `json:"username"`
+// 	AvatarURL string `json:"avatar_url"`
+// 	Email     string `json:"email"`
+// }
+// type Project struct {
+// 	ID                int         `json:"id"`
+// 	Name              string      `json:"name"`
+// 	Description       interface{} `json:"description"`
+// 	WebURL            string      `json:"web_url"`
+// 	AvatarURL         interface{} `json:"avatar_url"`
+// 	GitSSHURL         string      `json:"git_ssh_url"`
+// 	GitHTTPURL        string      `json:"git_http_url"`
+// 	Namespace         string      `json:"namespace"`
+// 	VisibilityLevel   int         `json:"visibility_level"`
+// 	PathWithNamespace string      `json:"path_with_namespace"`
+// 	DefaultBranch     string      `json:"default_branch"`
+// 	CiConfigPath      string      `json:"ci_config_path"`
+// }
+// type Author struct {
+// 	Name  string `json:"name"`
+// 	Email string `json:"email"`
+// }
+// type Commit struct {
+// 	ID        string    `json:"id"`
+// 	Message   string    `json:"message"`
+// 	Title     string    `json:"title"`
+// 	Timestamp time.Time `json:"timestamp"`
+// 	URL       string    `json:"url"`
+// 	Author    Author    `json:"author"`
+// }
+// type Runner struct {
+// 	ID          int      `json:"id"`
+// 	Description string   `json:"description"`
+// 	RunnerType  string   `json:"runner_type"`
+// 	Active      bool     `json:"active"`
+// 	IsShared    bool     `json:"is_shared"`
+// 	Tags        []string `json:"tags"`
+// }
+// type ArtifactsFile struct {
+// 	Filename interface{} `json:"filename"`
+// 	Size     interface{} `json:"size"`
+// }
+// type Builds struct {
+// 	ID             int64         `json:"id"`
+// 	Stage          string        `json:"stage"`
+// 	Name           string        `json:"name"`
+// 	Status         string        `json:"status"`
+// 	CreatedAt      string        `json:"created_at"`
+// 	StartedAt      string        `json:"started_at"`
+// 	FinishedAt     string        `json:"finished_at"`
+// 	Duration       float64       `json:"duration"`
+// 	QueuedDuration float64       `json:"queued_duration"`
+// 	FailureReason  interface{}   `json:"failure_reason"`
+// 	When           string        `json:"when"`
+// 	Manual         bool          `json:"manual"`
+// 	AllowFailure   bool          `json:"allow_failure"`
+// 	User           User          `json:"user"`
+// 	Runner         Runner        `json:"runner"`
+// 	ArtifactsFile  ArtifactsFile `json:"artifacts_file"`
+// 	Environment    interface{}   `json:"environment"`
+// }
+// type Project struct {
+// 	ID                int    `json:"id"`
+// 	WebURL            string `json:"web_url"`
+// 	PathWithNamespace string `json:"path_with_namespace"`
+// }
+// type SourcePipeline struct {
+// 	Project    Project `json:"project"`
+// 	JobID      int64   `json:"job_id"`
+// 	PipelineID int     `json:"pipeline_id"`
+// }
