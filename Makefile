@@ -6,14 +6,22 @@
 # +RELEASE_NAME		# helm release name for test
 # +TEST_NAMESPACE	# K8s namespace for test release
 
+GO ?= go1.21.5
+
 envTest:
 	echo ${HELLO}
 	${HELM} -n ${TEST_NAMESPACE} list
 
-build:
-	CGO_ENABLED=1 go build -o app main.go
+depsList:
+	$(GO) list -m -u all
+	# follow with https://go.dev/doc/modules/managing-dependencies#getting_version
+depsTidy:
+	$(GO) mod tidy
 
-imageBuild:
+buildBibary:
+	CGO_ENABLED=1 $(GO) build -o app main.go
+
+buildImage:
 	rm -f app
 	docker build -t test .
 

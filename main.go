@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"io/ioutil"
+	"time"
 
 	b64 "encoding/base64"
 	"encoding/json"
@@ -14,6 +15,10 @@ import (
 	_ "os"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -126,6 +131,51 @@ func containsValuesInArray(values []string, array []string) bool {
 	}
 	return false
 }
+
+var (
+	pipelinesCreatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "pipelines_created_total",
+		Help: "All pipelines created",
+	},
+	// pipelinesCreatedTotal.Inc()
+	)
+)
+var (
+	stagesCreatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "stages_created_total",
+		Help: "All stages created across all pipelines",
+	},
+	// stagesCreatedTotal.Inc()
+	)
+)
+var (
+	jobsCreatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "jobs_created_total",
+		Help: "All jobs created across all pipelines",
+	},
+	// jobsCreatedTotal.Inc()
+	)
+)
+var (
+	pipelinesCreatedPerProject = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pipelines_created_for_project",
+			Help: "Per project pipelines count",
+		},
+		[]string{"project", "branch"}, // Specify the label names here
+		// pipelinesCreatedPerProject.WithLabelValues("value1", "value2").Inc()
+	)
+)
+
+func recordMetrics() {
+	go func() {
+		for {
+			pipelinesCreatedTotal.Inc()
+			time.Sleep(60 * time.Second)
+		}
+	}()
+}
+
 func main() {
 
 	// Set variables from environment
@@ -259,6 +309,7 @@ func main() {
 		}
 		//fmt.Printf("%+v\n", vgitlabEvent)
 	})
+	http.Handle("/metrics", promhttp.Handler())
 	http.ListenAndServe("0.0.0.0:4000", nil)
 }
 func checkErr(err error) {
